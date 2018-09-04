@@ -48,14 +48,21 @@ struct Message {
 
 fn in_order_check(rx: mpsc::Receiver<Message>) -> impl Future<Item = (), Error = ()> {
 	println!("starting checker");
-	rx.fold(Message { sent_at: 0, received_at: 0, client_id: 0 }, |old, new| {
+	rx.fold((Message { sent_at: 0, received_at: 0, client_id: 0 }, [0u64;4]), |(old, mut map), new| {
 		assert!(new.received_at > old.received_at);
 		if new.sent_at < old.sent_at {
 			println!("{:?} sent earlier than {:?}, but received later", new, old);
 		}
+		map[new.client_id as usize] += 1;
+		if map[new.client_id as usize] % 100_000 == 0 {
+			for i in 0..4 {
+				println!("client id: {} count: {}", i, map[i as usize])
+			}
+			println!("------------");
+		}
 		//assert!(new.sent_at > old.sent_at);
 		//println!("{}: tid {}", new.1, new.0);
-		Ok(new)
+		Ok((new, map))
 	}).map(|_| ())
 }
 
@@ -99,9 +106,6 @@ fn client(id: u64) -> impl Future<Item = (), Error = ()> {
 				}
 				buf
 			};
-			if count % 100000 == 0 {
-				println!("client {} sent: {}", id, count);
-			}
 			write_all(stream, buf).and_then(move |(stream, _)| Ok(Loop::Continue((stream, count+1))))
 	})).map_err(|e| panic!("{}", e));
 	conn
