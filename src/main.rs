@@ -26,12 +26,12 @@ use std::io::Read;
 use scheduler::CpuSet;
 
 fn main() {
+	let mio = std::env::args().any(|arg| arg == "mio");
 	let cpu = CpuSet::single(0);
 	scheduler::set_self_affinity(cpu).unwrap();
 
 	let mut rt = current_thread::Runtime::new().unwrap();
 	let (tx, rx) = mpsc::channel(1024 * 1024 * 1024);
-	let mio = true;
 	if !mio {
 		rt.spawn(server(tx.clone()));
 	}
