@@ -26,7 +26,9 @@ use std::io::Read;
 use scheduler::CpuSet;
 
 fn main() {
-	let mio = std::env::args().any(|arg| arg == "mio");
+	let mio_edge = std::env::args().any(|arg| arg == "mio-edge");
+	let mio_level = std::env::args().any(|arg| arg == "mio-level");
+	let mio = mio_edge || mio_level;
 	let cpu = CpuSet::single(0);
 	scheduler::set_self_affinity(cpu).unwrap();
 
@@ -41,13 +43,17 @@ fn main() {
 		let cpu = CpuSet::single(3);
 		scheduler::set_self_affinity(cpu).unwrap();
 		let mut rt = current_thread::Runtime::new().unwrap();
-		rt.block_on(in_order_check(rx));
+		rt.block_on(in_order_check(rx)).unwrap();
 	});
 	if !mio {
-		rt.run();	
+		rt.run().unwrap();	
 	}
 	if mio {
-		mio_server(tx);
+		if mio_edge {
+			mio_server_edge(tx);
+		} else if mio_level {
+			mio_server_level(tx);
+		}
 	}
 }
 
@@ -56,7 +62,7 @@ fn client_thread(id: u64) {
 	scheduler::set_self_affinity(cpu).unwrap();
 	let mut rt = current_thread::Runtime::new().unwrap();
 	println!("starting client {}", id);
-	rt.block_on(client(id));
+	rt.block_on(client(id)).unwrap();
 }
 
 #[derive(Debug)]
@@ -87,7 +93,67 @@ fn in_order_check(rx: mpsc::Receiver<Message>) -> impl Future<Item = (), Error =
 	}).map(|_| ())
 }
 
-fn mio_server(mut tx: mpsc::Sender<Message>) {
+fn mio_server_edge(mut tx: mpsc::Sender<Message>) {
+	use mio::*;
+	use mio::net::{TcpListener, TcpStream};
+	use std::collections::BTreeMap;
+
+	println!("mio server");
+	const SERVER: Token = Token(0);
+	let mut clients: BTreeMap<usize, _> = BTreeMap::new();
+	let mut next_token = 1;
+	let server = TcpListener::bind(&(([127, 0, 0, 1], 9000).into())).unwrap();
+	let poll = mio::Poll::new().unwrap();
+	poll.register(&server, SERVER, Ready::readable() | Ready::writable(), PollOpt::edge()).unwrap();
+
+	let mut events = Events::with_capacity(1024);
+
+	loop {
+		poll.poll(&mut events, None).unwrap();
+
+		for event in events.iter() {
+			match event.token() {
+				SERVER => {
+					let (client, _) = server.accept().unwrap();
+					println!("accepted client {} {:?}", next_token, client);
+					poll.register(&client, Token(next_token), Ready::readable(), PollOpt::edge()).unwrap();
+					clients.insert(next_token-1, client);
+					next_token += 1;
+					println!("{:?}", clients);
+					poll.reregister(&server, SERVER, Ready::readable(), PollOpt::edge()).unwrap();
+				}
+				Token(idx) => {
+					let client = clients.get_mut(&(idx-1)).unwrap();
+					loop {
+						let mut buf = [0; 16];
+						if let Err(err) = client.read_exact(&mut buf) {
+							match err.kind() {
+								std::io::ErrorKind::WouldBlock => break,
+								_ => panic!("io error"),
+							}
+						}
+						let mut cur = Cursor::new(&buf);
+						let now = tsc::rdtsc();
+						let id = cur.read_u64::<LittleEndian>().unwrap();
+						let ts = cur.read_u64::<LittleEndian>().unwrap();
+						let msg = Message {
+							sent_at: ts,
+							received_at: now,
+							client_id: id,
+						};
+						if let Err(err) = tx.try_send(msg) {
+							panic!("err {}", err);
+						}
+					}
+					poll.reregister(client, Token(idx), Ready::readable(), PollOpt::edge()).unwrap();
+				}
+			}
+		}
+	}
+
+}
+
+fn mio_server_level(mut tx: mpsc::Sender<Message>) {
 	use mio::*;
 	use mio::net::{TcpListener, TcpStream};
 	use std::collections::BTreeMap;
@@ -132,6 +198,7 @@ fn mio_server(mut tx: mpsc::Sender<Message>) {
 					if let Err(err) = tx.try_send(msg) {
 						panic!("err {}", err);
 					}
+					poll.reregister(client, Token(idx), Ready::readable(), PollOpt::level()).unwrap();
 				}
 			}
 		}
